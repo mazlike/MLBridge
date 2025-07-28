@@ -1,0 +1,49 @@
+# === Python ===
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.pdb
+*.pkl
+*.egg
+*.egg-info/
+.eggs/
+*.manifest
+*.spec
+
+# Virtual environment
+venv/
+env/
+.venv/
+ENV/
+env.bak/
+pip-wheel-metadata/
+
+# Jupyter (если используешь)
+.ipynb_checkpoints/
+
+# === Qt / PySide ===
+# Сгенерированные UI-файлы
+ui_*.py
+# Скомпилированные ресурсы
+qrc_*.py
+# Qt Designer файлы кеша
+*.qmlc
+*.jsc
+
+# === OS ===
+.DS_Store
+Thumbs.db
+
+# === IDE ===
+.vscode/
+.idea/
+*.swp
+
+# === Build / Dist ===
+build/
+dist/
+*.egg-info/
+*.log
+
+.env
