@@ -1,48 +1,24 @@
-import sys, os, shutil
-from datetime import datetime
-from pathlib import Path
-from send2trash import send2trash
+import sys, os, shutil, logging
 import pandas as pd
+
 from ui_mainwindow import Ui_MainWindow
-import logging
+from datetime import datetime
+
+from send2trash import send2trash
 
 from PySide6.QtWidgets import QApplication, QMainWindow, QMenu, QMessageBox, QFileDialog, QListWidgetItem
-from PySide6.QtCore import Qt, QObject, Signal, QThread, QStandardPaths, QUrl 
+from PySide6.QtCore import Qt, QObject, Signal, QThread, QUrl 
 from PySide6.QtGui import QIcon, QDesktopServices
-from model_inference import load_data, load_model_and_tokenizer_pth, predict, load_model_and_tokenizer
-from sklearn.metrics import accuracy_score, classification_report
-import json
+from sklearn.metrics import classification_report
 
-# Определяем базовый каталог приложения
-if getattr(sys, 'frozen', False):
-    BASE_DIR = os.path.dirname(sys.executable)
-else:
-    BASE_DIR = os.path.dirname(__file__)
-
-# Дефолтные папки внутри BASE_DIR
-MODELS_DIR = os.path.join(BASE_DIR, "models")
-DATA_DIR   = os.path.join(BASE_DIR, "data")
-DOWNLOADS_DIR = QStandardPaths.writableLocation(QStandardPaths.DownloadLocation)
-RESULTS_DIR = os.path.join(BASE_DIR, "results") 
-
-# Путь к _internal/config.json
-config_path = os.path.join(BASE_DIR, "config.json")
-
-# Чтение и загрузка
-with open(config_path, "r", encoding="utf-8") as f:
-    config = json.load(f)
-
-# Используем переменные
-class_names = config.get("class_names", [])
+from workers import InferenceWorker
+from config import BASE_DIR, MODELS_DIR, DATA_DIR, DOWNLOADS_DIR, RESULTS_DIR
 
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowIcon(QIcon("icon256.ico"))
-                
-        os.makedirs(MODELS_DIR, exist_ok=True)
-        os.makedirs(DATA_DIR,   exist_ok=True)
-        os.makedirs(RESULTS_DIR, exist_ok=True)
+        self._init_dirs()
         
         # Инициализация UI
         self.ui = Ui_MainWindow()
@@ -52,6 +28,22 @@ class MainWindow(QMainWindow):
         self.model_path = None
         self.data_path = None
         
+        self._init_connections()
+        self._init_logging()
+        
+        # Загрузить сохранённые ранее пути
+        self.load_lists()
+        self.ui.actionRefresh.clicked.connect(self.load_lists)
+        
+        self._init_context_menus()
+        
+    def _init_dirs(self):
+        for d in (MODELS_DIR, DATA_DIR, RESULTS_DIR):
+            os.makedirs(d, exist_ok=True)
+        self.last_model_files = set()
+        self.last_data_files = set()
+    
+    def _init_connections(self):
         # Подключаем экшены меню
         self.ui.actionLoadModel.triggered.connect(self.load_model_folder)
         self.ui.actionLoadData.triggered.connect(self.load_data)
@@ -69,28 +61,36 @@ class MainWindow(QMainWindow):
         
         self.ui.startInference.clicked.connect(self.inference)
         
-        # ——————————————————————————————
-        # Перенаправляем stdout/stderr в plainTextEdit
+    def _init_logging(self):
         self.log_widget = self.ui.inferenceLogs
-        
         self.stream = EmittingStream()
         self.stream.textWritten.connect(self.log_widget.appendPlainText)
-        
-        sys.stdout = self.stream
-        sys.stderr = self.stream
-        
-        # ——————————————————————————————
-        # Настраиваем модуль logging
+        sys.stdout = sys.stderr = self.stream
+
         handler = logging.StreamHandler(self.stream)
-        handler.setFormatter(logging.Formatter("%(asctime)s — %(levelname)s — %(message)s"))
-        logging.getLogger().addHandler(handler)
-        logging.getLogger().setLevel(logging.INFO)
-        
-        # Загрузить сохранённые ранее пути
-        self.load_lists()
-        self.ui.actionRefresh.clicked.connect(self.load_lists)
-        
-        self._init_context_menus()
+        handler.setFormatter(
+            logging.Formatter("%(asctime)s — %(levelname)s — %(message)s")
+        )
+        root = logging.getLogger()
+        root.addHandler(handler)
+        root.setLevel(logging.INFO)
+    
+    def _update_buttons_state(self):
+        """
+        Включаем startInference, когда заданы и модель, и данные.
+        Сбрасываем saveResults, пока не будет нового инференса.
+        """
+        ready = bool(getattr(self, 'model_path', None) and getattr(self, 'data_path', None))
+        self.ui.startInference.setEnabled(ready)
+        self.ui.saveResults.setEnabled(False)
+
+    def _init_context_menus(self):
+        """Привязываем правый клик для удаления."""
+        for widget in (self.ui.listWidgetModel, self.ui.listWidgetData):
+            widget.setContextMenuPolicy(Qt.CustomContextMenu)
+            widget.customContextMenuRequested.connect(
+                lambda pos, w=widget: self.open_context_menu(w, pos)
+            )
     
     def show_about(self):
         QMessageBox.about(
@@ -113,40 +113,40 @@ class MainWindow(QMainWindow):
         QDesktopServices.openUrl(QUrl.fromLocalFile(path))
     
     def load_lists(self):
-        """Сканируем папки models/ и data/ и заполняем QListWidget’ы,
-           сохраняя при этом выделение по именам."""
-        # 1. Сохраняем названия выделенных элементов
+        current_model_files = {
+            f.name: f.path for f in os.scandir(MODELS_DIR) if f.is_dir()
+        }
+        current_data_files = {
+            f.name: f.path for f in os.scandir(DATA_DIR) if f.name.lower().endswith((".csv", ".xlsx"))
+        }
+
+        # Если ничего не изменилось — просто выходим
+        if set(current_model_files) == self.last_model_files and set(current_data_files) == self.last_data_files:
+            return
+
+        self.last_model_files = set(current_model_files)
+        self.last_data_files = set(current_data_files)
+
+        # Сохраняем выделения
         sel_models = {item.text() for item in self.ui.listWidgetModel.selectedItems()}
         sel_data   = {item.text() for item in self.ui.listWidgetData.selectedItems()}
 
-        # 2. Блокируем обновления и сигналы, чтобы при добавлении не прыгал курсор
-        for lw in (self.ui.listWidgetModel, self.ui.listWidgetData):
-            lw.blockSignals(True)
-            lw.setUpdatesEnabled(False)
-            # дополнительно сбрасываем текущее выделение/строку,
-            # чтобы Qt не выбирал автоматически какой-то элемент
-            lw.clearSelection()
-            lw.setCurrentRow(-1)
-
-        # 3. Очищаем списки
+        # Очищаем
         self.ui.listWidgetModel.clear()
         self.ui.listWidgetData.clear()
 
-        # 4. Заполняем модели
-        for entry in os.scandir(MODELS_DIR):
-            if entry.is_dir():
-                item = QListWidgetItem(entry.name)
-                item.setData(Qt.UserRole, entry.path)
-                self.ui.listWidgetModel.addItem(item)
+        # Заполняем заново
+        for name, path in current_model_files.items():
+            item = QListWidgetItem(name)
+            item.setData(Qt.UserRole, path)
+            self.ui.listWidgetModel.addItem(item)
 
-        # 5. Заполняем данные
-        for entry in os.scandir(DATA_DIR):
-            if entry.name.lower().endswith((".csv", ".xlsx")):
-                item = QListWidgetItem(entry.name)
-                item.setData(Qt.UserRole, entry.path)
-                self.ui.listWidgetData.addItem(item)
+        for name, path in current_data_files.items():
+            item = QListWidgetItem(name)
+            item.setData(Qt.UserRole, path)
+            self.ui.listWidgetData.addItem(item)
 
-        # 6. Восстанавливаем выделение по имени
+        # Восстанавливаем выделение
         for lw, sel in (
             (self.ui.listWidgetModel, sel_models),
             (self.ui.listWidgetData, sel_data)
@@ -156,13 +156,8 @@ class MainWindow(QMainWindow):
                 if item.text() in sel:
                     item.setSelected(True)
 
-        # 7. Включаем обновления и сигналы обратно
-        for lw in (self.ui.listWidgetModel, self.ui.listWidgetData):
-            lw.setUpdatesEnabled(True)
-            lw.blockSignals(False)
-
-        # 8. Обновляем состояние кнопок
         self._update_buttons_state()
+
 
   
     
@@ -186,24 +181,6 @@ class MainWindow(QMainWindow):
             except Exception as e:
                 logging.error(f"Не удалось отправить в корзину {path}: {e}")
 
-            
-                
-    def _update_buttons_state(self):
-        """
-        Включаем startInference, когда заданы и модель, и данные.
-        Сбрасываем saveResults, пока не будет нового инференса.
-        """
-        ready = bool(getattr(self, 'model_path', None) and getattr(self, 'data_path', None))
-        self.ui.startInference.setEnabled(ready)
-        self.ui.saveResults.setEnabled(False)
-
-    def _init_context_menus(self):
-        """Привязываем правый клик для удаления."""
-        for widget in (self.ui.listWidgetModel, self.ui.listWidgetData):
-            widget.setContextMenuPolicy(Qt.CustomContextMenu)
-            widget.customContextMenuRequested.connect(
-                lambda pos, w=widget: self.open_context_menu(w, pos)
-            )
     
     def on_item_selected(self, item: QListWidgetItem):
         """
@@ -234,6 +211,7 @@ class MainWindow(QMainWindow):
        
             
     def inference(self):
+        
         self.with_labels = self.ui.infWithLabels.isChecked()
         
         # Проверяем, что модель и данные выбраны
@@ -377,78 +355,6 @@ class MainWindow(QMainWindow):
         
         self.load_lists()
             
-class InferenceWorker(QObject):
-    # Сигналы, которые будут эмитироваться в GUI‑поток
-    finished = Signal()                     # когда всё завершилось
-    error    = Signal(str)                  # при исключении
-    progress = Signal(int)                  # для отчёта о прогрессе (0–100)
-    result   = Signal(list, list, list, list, object)
-    
-    def __init__(self, model_path, data_path, batch_size, with_labels=False):
-        super().__init__()
-        self.model_path = model_path
-        self.data_path  = data_path
-        self.batch_size = batch_size
-        self.with_labels  = with_labels
-
-    def run(self):
-        """Метод, куда вынесена вся тяжёлая работа."""
-        try:            
-            if has_pth_files(self.model_path):
-                # try:
-                #    model, tokenizer, device, id2label = load_model_and_tokenizer_pth(
-                #         self.model_path, class_names
-                #     )
-                #    logging.info("Модель и токенизатор загружены.") 
-                # except Exception as e:
-                #     logging.error(f"Ошибка загрузки модели .pth {e}")
-                #     return
-                ...
-            else:
-                try:
-                    # Загрузка модели и токенизатора + device
-                    model, tokenizer, device, id2label = load_model_and_tokenizer(
-                        self.model_path, class_names
-                    )
-                    logging.info("Модель и токенизатор загружены.")
-                except Exception as e:
-                    logging.error("Ошибка загрузки модели" + str(e))
-                    return
-                
-            try:
-                if self.with_labels:
-                    texts, raw_labels = load_data(self, self.data_path, sep=';')
-                    filtered = [(t, l) for t, l in zip(texts, raw_labels) 
-                                if isinstance(l, str) and l in model.config.label2id]
-                    if not filtered:
-                        raise ValueError("Нет валидных строк с метками из label2id")
-                    logging.info(f"Загружено {len(texts)} примеров, после фильтрации осталось {len(texts)}.")
-                else:
-                    texts = load_data(self, self.data_path, sep=';')    
-                # Предсказание
-                logging.info("Запуск предсказания...")
-                preds, probs = predict(self, texts, model, tokenizer, device,
-                                    batch_size=self.batch_size)
-                logging.info("Предсказание завершено.")
-                
-                self.progress.emit(100)
-            except Exception as e:
-                logging.error("Ошибка предсказания" + str(e))
-                return
-            
-            # Отображаем метрики в консоли Qt
-            if self.with_labels:
-                texts, true_labels = zip(*filtered)
-                true_labels = [model.config.label2id[l] for l in true_labels]
-                acc = accuracy_score(true_labels, preds)
-                logging.info(f"Accuracy: {acc:.4f}")
-                self.result.emit(texts, preds, probs, true_labels, id2label)
-            else:
-                self.result.emit(texts, preds, probs, [], id2label)
-        except Exception as e:
-            self.error.emit(str(e))
-        finally:
-            self.finished.emit()
 
 class EmittingStream(QObject):
     """
@@ -464,21 +370,10 @@ class EmittingStream(QObject):
             
     def flush(self):
         pass
-
-def has_pth_files(folder_path: str) -> bool:
-        """
-        Возвращает True, если в папке есть хотя бы один файл с суффиксом .pth.
-        """
-        p = Path(folder_path)
-        # Итерируемся по всем элементам папки и проверяем суффикс
-        for child in p.iterdir():
-            if child.is_file() and child.suffix.lower() == ".pth":
-                return True
-        return False
-
             
 if __name__ == '__main__':
     app = QApplication(sys.argv)
+    
     window = MainWindow()
     window.show()
     sys.exit(app.exec())
