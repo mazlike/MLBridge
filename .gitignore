@@ -47,3 +47,11 @@ dist/
 *.log
 
 .env
+
+*.ico
+
+models/
+data/
+icons/
+results/
+*.json

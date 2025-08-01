@@ -37,8 +37,14 @@
   <property name="windowTitle">
    <string>MLBridge</string>
   </property>
+  <property name="toolButtonStyle">
+   <enum>Qt::ToolButtonStyle::ToolButtonIconOnly</enum>
+  </property>
   <property name="tabShape">
    <enum>QTabWidget::TabShape::Rounded</enum>
+  </property>
+  <property name="unifiedTitleAndToolBarOnMac">
+   <bool>false</bool>
   </property>
   <widget class="QWidget" name="mainWidget">
    <property name="sizePolicy">
@@ -61,6 +67,28 @@
       </item>
       <item>
        <widget class="QListWidget" name="listWidgetData"/>
+      </item>
+      <item>
+       <widget class="QPushButton" name="actionRefresh">
+        <property name="sizePolicy">
+         <sizepolicy hsizetype="Minimum" vsizetype="Fixed">
+          <horstretch>0</horstretch>
+          <verstretch>0</verstretch>
+         </sizepolicy>
+        </property>
+        <property name="text">
+         <string/>
+        </property>
+        <property name="icon">
+         <iconset theme="QIcon::ThemeIcon::ViewRefresh"/>
+        </property>
+        <property name="shortcut">
+         <string>Ctrl+S, Ctrl+S</string>
+        </property>
+        <property name="flat">
+         <bool>true</bool>
+        </property>
+       </widget>
       </item>
      </layout>
     </item>
@@ -221,32 +249,24 @@
     <property name="title">
      <string>Файл</string>
     </property>
-    <widget class="QMenu" name="menuLoadModel">
-     <property name="title">
-      <string>Загрузить модель...</string>
-     </property>
-     <addaction name="actionLoadZip"/>
-     <addaction name="actionLoadFolder"/>
-    </widget>
-    <addaction name="menuLoadModel"/>
+    <addaction name="actionLoadModel"/>
     <addaction name="actionLoadData"/>
-    <addaction name="actionExit"/>
-   </widget>
-   <widget class="QMenu" name="menuSettings">
-    <property name="title">
-     <string>Настройки</string>
-    </property>
-    <addaction name="actionDefaultPath"/>
    </widget>
    <widget class="QMenu" name="menuDocs">
     <property name="title">
      <string>Справка</string>
     </property>
-    <addaction name="actionDocumentation"/>
     <addaction name="actionAbout"/>
    </widget>
+   <widget class="QMenu" name="menu">
+    <property name="title">
+     <string>Папки</string>
+    </property>
+    <addaction name="actionOpenResults"/>
+    <addaction name="actionOpenAppFolder"/>
+   </widget>
    <addaction name="menuFile"/>
-   <addaction name="menuSettings"/>
+   <addaction name="menu"/>
    <addaction name="menuDocs"/>
   </widget>
   <widget class="QStatusBar" name="statusBar"/>
@@ -293,6 +313,21 @@
   <action name="actionLoadFolder">
    <property name="text">
     <string>Папка</string>
+   </property>
+  </action>
+  <action name="actionLoadModel">
+   <property name="text">
+    <string>Загрузить модель...</string>
+   </property>
+  </action>
+  <action name="actionOpenResults">
+   <property name="text">
+    <string>Открыть папку с результатами...</string>
+   </property>
+  </action>
+  <action name="actionOpenAppFolder">
+   <property name="text">
+    <string>Открыть папку с программой...</string>
    </property>
   </action>
  </widget>
