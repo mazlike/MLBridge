@@ -54,4 +54,5 @@ models/
 data/
 icons/
 results/
+config/
 *.json

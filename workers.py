@@ -27,7 +27,6 @@ class InferenceWorker(QObject):
 
     def run(self):
         """Метод, куда вынесена вся тяжёлая работа."""
-        
         try:            
             if self.has_pth_files(self.model_path):
                 # try:
@@ -39,6 +38,7 @@ class InferenceWorker(QObject):
                 #     logging.error(f"Ошибка загрузки модели .pth {e}")
                 #     return
                 logging.info("Найдены .pth файлы, но функционала пока что нет")
+                return
             else:
                 try:
                     # Загрузка модели и токенизатора + device

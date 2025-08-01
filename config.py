@@ -13,8 +13,8 @@ DATA_DIR   = os.path.join(BASE_DIR, "data")
 DOWNLOADS_DIR = QStandardPaths.writableLocation(QStandardPaths.DownloadLocation)
 RESULTS_DIR = os.path.join(BASE_DIR, "results") 
 
-# Путь к _internal/config.json
-config_path = os.path.join(BASE_DIR, "config.json")
+# Путь к config.json
+config_path = os.path.join(BASE_DIR, "config\config.json")
 
 # Чтение и загрузка
 with open(config_path, "r", encoding="utf-8") as f:
