@@ -1,86 +1,138 @@
 import logging
 from pathlib import Path
+from typing import List, Tuple
 from PySide6.QtCore import QObject, Signal
-from model_inference import load_data, load_model_and_tokenizer, predict
-from sklearn.metrics import accuracy_score 
+
+import torch
+
+from model_inference import load_data, load_model_and_tokenizer, predict  # предполагается существование
+from sklearn.metrics import accuracy_score
 from config import CLASS_NAMES
 
+
 class InferenceWorker(QObject):
-    
-    # Сигналы, которые будут эмитироваться в GUI‑поток
-    finished = Signal()                     # когда всё завершилось
-    error    = Signal(str)                  # при исключении
-    progress = Signal(int)                  # для отчёта о прогрессе (0–100)
-    result   = Signal(list, list, list, list, object)
-    
-    def __init__(self, model_path, data_path, batch_size, with_labels=False):
+    finished = Signal()
+    error = Signal(str)
+    progress = Signal(int)                 # 0..100
+    result = Signal(list, list, list, list, object)
+
+    def __init__(self, model_path: str, data_path: str, batch_size: int, with_labels: bool = False):
         super().__init__()
-        self.model_path = model_path
-        self.data_path  = data_path
-        self.batch_size = batch_size
-        self.with_labels  = with_labels
+        self.model_path = Path(model_path)
+        self.data_path = Path(data_path)
+        self.batch_size = int(batch_size)
+        self.with_labels = with_labels
 
     @staticmethod
-    def has_pth_files(folder_path: str) -> bool:
-        p = Path(folder_path)
-        return any(child.is_file() and child.suffix.lower() == ".pth" for child in p.iterdir())
+    def has_pth_files(folder_path: Path) -> bool:
+        try:
+            p = Path(folder_path)
+            if not p.exists() or not p.is_dir():
+                return False
+            return any(child.is_file() and child.suffix.lower() == ".pth" for child in p.iterdir())
+        except Exception:
+            logging.exception("Ошибка при проверке .pth файлов")
+            return False
+
+    def _emit_error(self, message: str):
+        logging.error(message)
+        try:
+            self.error.emit(message)
+        except Exception:
+            logging.exception("Не удалось эмитить сигнал ошибки")
+
+    def _validate_inputs(self) -> bool:
+        if not self.model_path.exists():
+            self._emit_error(f"Путь к модели не найден: {self.model_path}")
+            return False
+        if not self.data_path.exists():
+            self._emit_error(f"Путь к данным не найден: {self.data_path}")
+            return False
+        if self.batch_size <= 0:
+            self._emit_error("batch_size должен быть > 0")
+            return False
+        return True
 
     def run(self):
-        """Метод, куда вынесена вся тяжёлая работа."""
-        try:            
+        """Главный метод — загружает модель, данные и делает предсказание."""
+        try:
+            self.progress.emit(0)
+
+            if not self._validate_inputs():
+                return  # _emit_error уже вызван
+
+            # Проверка наличия .pth (временная заглушка)
             if self.has_pth_files(self.model_path):
-                # try:
-                #    model, tokenizer, device, id2label = load_model_and_tokenizer_pth(
-                #         self.model_path, class_names
-                #     )
-                #    logging.info("Модель и токенизатор загружены.") 
-                # except Exception as e:
-                #     logging.error(f"Ошибка загрузки модели .pth {e}")
-                #     return
-                logging.info("Найдены .pth файлы, но функционала пока что нет")
+                # можно реализовать отдельную загрузку .pth
+                msg = "Найдены .pth файлы, функционал загрузки .pth ещё не реализован."
+                self._emit_error(msg)
                 return
-            else:
-                try:
-                    # Загрузка модели и токенизатора + device
-                    model, tokenizer, device, id2label = load_model_and_tokenizer(
-                        self.model_path, CLASS_NAMES
-                    )
-                    logging.info("Модель и токенизатор загружены.")
-                except Exception as e:
-                    logging.error("Ошибка загрузки модели" + str(e))
-                    return
-                
+
+            # Загрузка модели / токенайзера
+            try:
+                model, tokenizer, device, id2label = load_model_and_tokenizer(str(self.model_path), CLASS_NAMES)
+                logging.info("Модель и токенизатор загружены.")
+            except Exception as e:
+                logging.exception("Ошибка загрузки модели/токенизатора")
+                self._emit_error(f"Ошибка загрузки модели: {e}")
+                return
+
+            # Загрузка данных
             try:
                 if self.with_labels:
-                    texts, raw_labels = load_data(self, self.data_path, sep=';')
-                    filtered = [(t, l) for t, l in zip(texts, raw_labels) 
-                                if isinstance(l, str) and l in model.config.label2id]
+                    texts, raw_labels = load_data(self, str(self.data_path), sep=';')  # ваш load_data может отличаться
+                # фильтрация по валидным меткам
+                    filtered: List[Tuple[str, str]] = [
+                        (t, l) for t, l in zip(texts, raw_labels)
+                        if isinstance(l, str) and l in model.config.label2id
+                    ]
                     if not filtered:
                         raise ValueError("Нет валидных строк с метками из label2id")
-                    logging.info(f"Загружено {len(texts)} примеров, после фильтрации осталось {len(texts)}.")
+                    logging.info(f"Загружено {len(texts)} примеров, после фильтрации осталось {len(filtered)}.")
+                    texts, true_labels_str = zip(*filtered)
+                    true_labels = [model.config.label2id[l] for l in true_labels_str]
                 else:
-                    texts = load_data(self, self.data_path, sep=';')    
-                # Предсказание
-                logging.info("Запуск предсказания...")
-                preds, probs = predict(self, texts, model, tokenizer, device,
-                                    batch_size=self.batch_size)
-                logging.info("Предсказание завершено.")
-                
-                self.progress.emit(100)
+                    texts = load_data(self, str(self.data_path), sep=';')
+                    true_labels = []
+                    logging.info(f"Загружено {len(texts)} примеров (без меток).")
             except Exception as e:
-                logging.error("Ошибка предсказания" + str(e))
+                logging.exception("Ошибка загрузки/обработки данных")
+                self._emit_error(f"Ошибка загрузки данных: {e}")
                 return
-            
-            # Отображаем метрики в консоли Qt
-            if self.with_labels:
-                texts, true_labels = zip(*filtered)
-                true_labels = [model.config.label2id[l] for l in true_labels]
-                acc = accuracy_score(true_labels, preds)
-                logging.info(f"Accuracy: {acc:.4f}")
-                self.result.emit(texts, preds, probs, true_labels, id2label)
-            else:
-                self.result.emit(texts, preds, probs, [], id2label)
+
+            # Предсказание с прогрессом
+            try:
+                model.eval()
+                preds, probs = predict(self, texts, model, tokenizer, device, batch_size=self.batch_size)
+                # Предполагаем, что predict уже эмитит прогресс через self.progress (как у вас было задумано).
+                self.progress.emit(100)
+                logging.info("Предсказание завершено.")
+            except Exception as e:
+                logging.exception("Ошибка при предсказании")
+                self._emit_error(f"Ошибка предсказания: {e}")
+                return
+
+            # Метрики и отправка результата
+            try:
+                if self.with_labels:
+                    acc = accuracy_score(true_labels, preds)
+                    logging.info(f"Accuracy: {acc:.4f}")
+                    self.result.emit(list(texts), list(preds), list(probs), list(true_labels), id2label)
+                else:
+                    self.result.emit(list(texts), list(preds), list(probs), [], id2label)
+            except Exception as e:
+                logging.exception("Ошибка при отправке результата")
+                self._emit_error(f"Ошибка отправки результата: {e}")
+                return
+
         except Exception as e:
-            self.error.emit(str(e))
+            logging.exception("Необработанная ошибка в run()")
+            self._emit_error(str(e))
         finally:
+            # Очистка VRAM (если использовался CUDA)
+            try:
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            except Exception:
+                logging.exception("Ошибка при очистке CUDA cache")
             self.finished.emit()

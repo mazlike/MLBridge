@@ -92,11 +92,31 @@ class MainWindow(QMainWindow):
                 lambda pos, w=widget: self.open_context_menu(w, pos)
             )
     
+    def _load_data(self, path):
+        """Попытаться прочитать CSV/XLSX и вернуть DataFrame или None."""
+        try:
+            ext = os.path.splitext(path)[1].lower()
+            if ext == '.csv':
+                try:
+                    df = pd.read_csv(path, low_memory=False, encoding='utf-8')
+                except UnicodeDecodeError:
+                    df = pd.read_csv(path, low_memory=False, encoding='cp1251')
+            elif ext in ('.xls', '.xlsx'):
+                df = pd.read_excel(path, engine='openpyxl')
+            else:
+                logging.warning("Неизвестный тип файла: %s", path)
+                return None
+            return df
+        except Exception as e:
+            logging.error("Ошибка при чтении файла данных %s: %s", path, e)
+            return None
+
+    
     def show_about(self):
         QMessageBox.about(
             self,
             "О программе MLBridge",
-            "<h2>MLBridge v1.0</h2>"
+            "<h2>MLBridge v1.1</h2>"
             "<p>Настольное приложение для инференса моделей.</p>"
             "<p>Автор: D.Subbota</p>"
             "<p>© 2025 Все права защищены.</p>"
@@ -249,11 +269,9 @@ class MainWindow(QMainWindow):
         """
         self.results_df = pd.DataFrame(
             {
-                "text":     texts,
-                "pred_label": [id2label[p] for p in preds]
+                "БлокML": [id2label[p] for p in preds]
             }
         )
-        
         if self.with_labels:
             report_dict = classification_report(
                 true_labels,
@@ -263,10 +281,9 @@ class MainWindow(QMainWindow):
             )
             # Конвертируем в DataFrame и транспонируем для удобства
             self.df_report = pd.DataFrame(report_dict).transpose()
-            logging.info("Сгенерирован classification report.")
         else:
             self.df_report = None
-            logging.info("classification report пропущен (infWithLabels=False).")
+            logging.info("classification report пропущен (без меток).")
             
         logging.info(f"Инференс завершён: предсказано {len(preds)} записей.")
         
@@ -275,15 +292,17 @@ class MainWindow(QMainWindow):
     def save_results(self):
         """
         Слот для кнопки 'Сохранить результаты' - сохраняет self.results_df в Excel.
+        Логика объединения одинаковая для случаев с меткой и без: если есть self.data,
+        пробуем объединить её с self.results_df по колонкам (если длины совпадают),
+        иначе сохраняем в разные листы.
         """
         if not hasattr(self, 'results_df'):
             logging.warning("Нет данных. Сначала выполните инференс.")
             return
-        # Собираем имя файла с датой
+
         default_name = f"predictions_{datetime.today().strftime('%Y_%m_%d')}.xlsx"
-        # Формируем полный путь внутри RESULTS_DIR
         default_path = os.path.join(RESULTS_DIR, default_name)
-        
+
         path, _ = QFileDialog.getSaveFileName(
             self,
             "Сохранить результаты в Excel",
@@ -292,16 +311,49 @@ class MainWindow(QMainWindow):
         )
         if not path:
             return
-        
+
         try:
-            # Сохраняем
-            with pd.ExcelWriter(path) as writer:
-                self.results_df.to_excel(writer, sheet_name='Результаты', index=False)
+            with pd.ExcelWriter(path, engine='openpyxl') as writer:
+                data_df = self._load_data(self.data_path)
+                
+                if data_df is not None:
+                    # Есть исходные данные — пробуем объединить
+                    try:
+                        combined = pd.concat(
+                            [data_df.reset_index(drop=True), self.results_df.reset_index(drop=True)],
+                            axis=1
+                        )
+                        # --- добавляем колонку "Ручная обработка" ---
+                        if 'Текст' in combined.columns:
+                            combined['Ручная обработка'] = combined['Текст'].astype(str).apply(
+                                lambda x: 'Нужна' if 'фото' in x.lower() else ''
+                            )
+                        else:
+                            logging.warning("Колонка 'Текст' не найдена, пропуск пометки 'Ручная обработка'")
+                        combined.to_excel(writer, sheet_name='Данные', index=False)
+                    except Exception as ex:
+                        logging.exception("Ошибка при объединении data и results_df: %s. Сохраняю отдельно.", ex)
+                        data_df.to_excel(writer, sheet_name='Данные', index=False)
+                        # --- добавляем колонку "Ручная обработка" ---
+                        if 'Текст' in data_df.columns:
+                            data_df['Ручная обработка'] = data_df['Текст'].astype(str).apply(
+                                lambda x: 'Нужна' if 'фото' in x.lower() else ''
+                            )
+                        else:
+                            logging.warning("Колонка 'Текст' не найдена, пропуск пометки 'Ручная обработка'")
+                        self.results_df.to_excel(writer, sheet_name='Результаты', index=False)
+                else:
+                    # Нет исходных данных — поведение как раньше
+                    self.results_df.to_excel(writer, sheet_name='Результаты', index=False)
+
+                # Сохраняем отчет если есть
                 if self.df_report is not None:
                     self.df_report.to_excel(writer, sheet_name='Classification Report')
-            self.ui.statusBar.showMessage(f"Таблица сохранена: {path}",  5000)
+
+            self.ui.statusBar.showMessage(f"Таблица сохранена: {path}", 5000)
         except Exception as e:
-            logging.critical(f"Ошибка сохранения! {e}")
+            logging.critical(f"Ошибка сохранения! {e}", exc_info=True)
+
 
     def load_model_folder(self):
         """Выбираем исходную папку с моделью, копируем её в ./models и обновляем список."""
