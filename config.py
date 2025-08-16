@@ -22,3 +22,5 @@ with open(config_path, "r", encoding="utf-8") as f:
 
 # Используем переменные
 CLASS_NAMES = config.get("class_names", [])
+BATCH_SIZE = config.get("batch_size", 0)
+EXPECTED_COLUMNS = config.get("expected_columns",[])

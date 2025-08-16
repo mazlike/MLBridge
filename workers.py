@@ -7,15 +7,16 @@ import torch
 
 from model_inference import load_data, load_model_and_tokenizer, predict  # предполагается существование
 from sklearn.metrics import accuracy_score
-from config import CLASS_NAMES
+from config import CLASS_NAMES, BATCH_SIZE
 
 
 class InferenceWorker(QObject):
     finished = Signal()
     error = Signal(str)
     progress = Signal(int)                 # 0..100
-    result = Signal(list, list, list, list, object)
-
+    result = Signal(list, list, list, list, list, object)
+    eta = Signal(str)
+    
     def __init__(self, model_path: str, data_path: str, batch_size: int, with_labels: bool = False):
         super().__init__()
         self.model_path = Path(model_path)
@@ -23,6 +24,17 @@ class InferenceWorker(QObject):
         self.batch_size = int(batch_size)
         self.with_labels = with_labels
 
+        
+        # <-- флаг отмены
+        self._stop_requested = False
+    def request_stop(self):
+        """Вызвать извне (MainWindow) для безопасной остановки."""
+        logging.info("Requesting stop for InferenceWorker")
+        self._stop_requested = True
+
+    def _is_stop_requested(self) -> bool:
+        return getattr(self, "_stop_requested", False)
+    
     @staticmethod
     def has_pth_files(folder_path: Path) -> bool:
         try:
@@ -61,10 +73,14 @@ class InferenceWorker(QObject):
             if not self._validate_inputs():
                 return  # _emit_error уже вызван
 
+            if self._is_stop_requested():
+                logging.info("Остановлено до начала работы.")
+                return
+            
             # Проверка наличия .pth (временная заглушка)
             if self.has_pth_files(self.model_path):
                 # можно реализовать отдельную загрузку .pth
-                msg = "Найдены .pth файлы, функционал загрузки .pth ещё не реализован."
+                msg = "Найдены .pth файлы, функционал загрузки .pth не реализован."
                 self._emit_error(msg)
                 return
 
@@ -75,6 +91,10 @@ class InferenceWorker(QObject):
             except Exception as e:
                 logging.exception("Ошибка загрузки модели/токенизатора")
                 self._emit_error(f"Ошибка загрузки модели: {e}")
+                return
+            
+            if self._is_stop_requested():
+                logging.info("Остановлено после загрузки модели.")
                 return
 
             # Загрузка данных
@@ -99,11 +119,15 @@ class InferenceWorker(QObject):
                 logging.exception("Ошибка загрузки/обработки данных")
                 self._emit_error(f"Ошибка загрузки данных: {e}")
                 return
-
+            
+            if self._is_stop_requested():
+                logging.info("Остановлено после загрузки данных.")
+                return
+            
             # Предсказание с прогрессом
             try:
                 model.eval()
-                preds, probs = predict(self, texts, model, tokenizer, device, batch_size=self.batch_size)
+                preds, probs, manual_flags = predict(self, texts, model, tokenizer, device, batch_size=self.batch_size)
                 # Предполагаем, что predict уже эмитит прогресс через self.progress (как у вас было задумано).
                 self.progress.emit(100)
                 logging.info("Предсказание завершено.")
@@ -115,11 +139,17 @@ class InferenceWorker(QObject):
             # Метрики и отправка результата
             try:
                 if self.with_labels:
-                    acc = accuracy_score(true_labels, preds)
-                    logging.info(f"Accuracy: {acc:.4f}")
-                    self.result.emit(list(texts), list(preds), list(probs), list(true_labels), id2label)
+                    if len(preds) < len(true_labels):
+                        true_labels = true_labels[:len(preds)]
+
+                    if len(preds) > 0:
+                        acc = accuracy_score(true_labels, preds)
+                        logging.info(f"Accuracy на предсказанных данных (в долях): {acc:.4f}")
+                    else:
+                        logging.warning("Нет предсказаний для вычисления метрик")
+                    self.result.emit(list(texts), list(manual_flags), list(preds), list(probs), list(true_labels), id2label)
                 else:
-                    self.result.emit(list(texts), list(preds), list(probs), [], id2label)
+                    self.result.emit(list(texts), list(manual_flags), list(preds), list(probs), [], id2label)
             except Exception as e:
                 logging.exception("Ошибка при отправке результата")
                 self._emit_error(f"Ошибка отправки результата: {e}")
@@ -135,4 +165,9 @@ class InferenceWorker(QObject):
                     torch.cuda.empty_cache()
             except Exception:
                 logging.exception("Ошибка при очистке CUDA cache")
-            self.finished.emit()
+            # гарантируем эмит finished
+            try:
+                self.finished.emit()
+            except Exception:
+                logging.exception("Не удалось эмитнуть finished")
+            

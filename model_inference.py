@@ -1,5 +1,7 @@
+import logging
 import os
 import re
+import time
 import pandas as pd
 import warnings
 warnings.simplefilter(action='ignore', category=FutureWarning)
@@ -7,6 +9,7 @@ import torch
 import transformers
 from torch.utils.data import DataLoader, Dataset
 import torch.nn.functional as F
+from config import EXPECTED_COLUMNS
 
 class TextDataset(Dataset):
     def __init__(self, texts):
@@ -18,37 +21,83 @@ class TextDataset(Dataset):
     
 def load_data(self, path: str, sep: str = ';'):
     """
-    Читает CSV или XLS/XLSX в зависимости от расширения файла.
+    Читает CSV или XLS/XLSX.
+    Для Excel ищет лист, где есть все ожидаемые колонки.
     Возвращает списки текстов и меток.
     """
     
+    if getattr(self, "_stop_requested", False):
+        logging.info("load_data: остановлено пользователем до чтения файла.")
+        raise InterruptedError("Остановлено пользователем")
+    
     _, ext = os.path.splitext(path)
     ext = ext.lower()
-    
+
     if ext in {".xlsx", ".xls"}:
-        df = pd.read_excel(path, engine="openpyxl")
+        xls = pd.ExcelFile(path, engine="openpyxl")
+
+        target_df = None
+        if self.with_labels:
+            expected = set(EXPECTED_COLUMNS)
+            for sheet in xls.sheet_names:
+                df = pd.read_excel(xls, sheet_name=sheet)
+                if expected.issubset(df.columns):
+                    logging.info(f"Найден лист '{sheet}' с колонками {expected}")
+                    target_df = df
+                    break
+            if target_df is None:
+                raise ValueError(f"Не найден лист с колонками {expected}")
+            
+            texts = target_df[EXPECTED_COLUMNS[0]].astype(str).tolist()
+            labels = target_df[EXPECTED_COLUMNS[1]].tolist()
+            return texts, labels
+
+        else:
+            for sheet in xls.sheet_names:
+                df = pd.read_excel(xls, sheet_name=sheet)
+                if 'Текст' in df.columns:
+                    logging.info(f"Найден лист '{sheet}' с колонкой 'Текст'")
+                    target_df = df
+                    break
+            if target_df is None:
+                raise ValueError("Не найден лист с колонкой 'Текст'")
+
+            texts = target_df['Текст'].astype(str).tolist()
+            return texts
+
     elif ext in {".csv"}:
         df = pd.read_csv(path, engine="python", sep=sep)
+        if self.with_labels:
+            expected = set(EXPECTED_COLUMNS)
+            if not expected.issubset(df.columns):
+                raise ValueError(f"Ожидаемые колонки {expected}, но найдены {set(df.columns)}")
+            texts = df[EXPECTED_COLUMNS[0]].astype(str).tolist()
+            labels = df[EXPECTED_COLUMNS[1]].tolist()
+            return texts, labels
+        else:
+            if 'Текст' not in df.columns:
+                raise ValueError(f"Ожидаем колонку 'Текст', но найдена {set(df.columns)}")
+            texts = df["Текст"].astype(str).tolist()
+            return texts
     else:
         raise ValueError(f"Неподдерживаемый формат файла: {ext}")
 
-    if self.with_labels:
-        expected = {'Текст', 'Блок'}
-        if not expected.issubset(df.columns):
-            raise ValueError(f"Ожидаемые колонки {expected}, но найдены {set(df.columns)}")
-        texts = df['Текст'].astype(str).tolist()
-        labels = df["Блок"].tolist()
-        return texts, labels
-    else:
-        if 'Текст' not in df.columns:
-            raise ValueError(f"Ожидаем колонку 'Текст', но найдена {set(df.columns)}")
-        
-        texts = df["Текст"].astype(str).tolist()
-        return texts
     
 # --- Прекомпилированные паттерны (делаем один раз при импортe модуля) ---
 HTML_TAG_RE = re.compile(r'<[^>]+>')
 URL_RE = re.compile(r'http[s]?://\S+|www\.\S+')
+URL_PATTERN = re.compile(
+    r"""(
+        https?://[^\s<>"]+           # http/https ссылки
+        |www\.[^\s<>"]+              # ссылки, начинающиеся с www
+        |\[                           # начало VK bbcode
+            (?:club|id|public|event|photo)\d+  # тип + цифры
+            \|[^\]]+                  # текст до закрывающей скобки
+        \]
+    )""",
+    re.VERBOSE | re.IGNORECASE
+)
+
 SQUARE_BRACKETS_RE = re.compile(r'\[.*?\]')
 EMOJI_RE = re.compile(
     "[" 
@@ -97,21 +146,44 @@ def remove_html_tags(text: str) -> str:
 
     return text.lower()
 
+def needs_manual_processing(text) -> bool:
+    """True если в оригинальном тексте есть url или слово 'фото'."""
+    if text is None:
+        return False
+    s = str(text)
+    return ('фото' in s.lower()) or (URL_PATTERN.search(s) is not None)
 
 def preprocess_texts(texts):
     """
-    Приводит texts (Series/list/np.array/str) к списку очищенных строк.
-    Использует vectorized apply для pandas.Series.
+    Возвращает кортеж (cleaned_texts, manual_flags).
+    cleaned_texts — список очищенных строк,
+    manual_flags — параллельный список булевых значений (True = нужна ручная обработка).
+    Поддерживает pd.Series, list/iterable или единичный объект.
     """
+    # pandas Series — делаем векторизованно через apply
     if isinstance(texts, pd.Series):
-        return texts.astype(str).apply(remove_html_tags).tolist()
+        orig = texts.astype(str)
+        flags = orig.apply(needs_manual_processing).tolist()
+        cleaned = orig.apply(remove_html_tags).tolist()
+        return cleaned, flags
+
+    # list или другой итерабельный (но не строка/bytes)
     elif isinstance(texts, list) or (hasattr(texts, '__iter__') and not isinstance(texts, (str, bytes))):
-        return [remove_html_tags(t) for t in texts]
+        flags = [needs_manual_processing(t) for t in texts]
+        cleaned = [remove_html_tags(t) for t in texts]
+        return cleaned, flags
+
     else:
         # единичный объект
-        return [remove_html_tags(texts)]
+        flag = needs_manual_processing(texts)
+        return [remove_html_tags(texts)], [flag]
 
-    
+def format_time(seconds: float) -> str:
+    """Конвертирует секунды в строку мм:сс"""
+    minutes = int(seconds) // 60
+    secs = int(seconds) % 60
+    return f"{minutes:02d}:{secs:02d}"
+   
 def predict(self, texts, model, tokenizer, device, batch_size=16, max_len=512):
     """
     Предсказывает классы и вероятности для списка текстов.
@@ -121,15 +193,25 @@ def predict(self, texts, model, tokenizer, device, batch_size=16, max_len=512):
     model.to(device)
     model.eval()
 
-    texts_clean = preprocess_texts(texts)
+    texts_clean, manual_flags = preprocess_texts(texts)
     dataset = TextDataset(texts_clean)   # TextDataset должен возвращать строку на getitem
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
     total_batches = len(loader) if len(loader) > 0 else 1
 
     all_probs, all_preds = [], []
-
+    manual_flags_out = []
+    
+    start_time = time.time()
+    avg_batch_time = None
+    
     with torch.no_grad():
         for batch_idx, batch in enumerate(loader):
+            # Проверяем флаг остановки перед обработкой батча
+            if getattr(self, "_stop_requested", False):
+                logging.info("predict: остановлено пользователем, прерываю цикл DataLoader.")
+                break
+            
+            batch_len = len(batch)
             # batch ожидается как list[str] — токенизируем список
             enc = tokenizer(
                 batch,
@@ -149,12 +231,24 @@ def predict(self, texts, model, tokenizer, device, batch_size=16, max_len=512):
 
             all_probs.extend(probs.cpu().tolist())
             all_preds.extend(preds)
+            start = batch_idx * batch_size
+            end = start + batch_len
+            manual_flags_out.extend(manual_flags[start:end])
+            
+            # ---- расчет времени ----
+            elapsed = time.time() - start_time
+            avg_batch_time = elapsed / (batch_idx + 1)
+            remaining_batches = total_batches - (batch_idx + 1)
+            eta_sec = avg_batch_time * remaining_batches
 
+            
             # чтобы в конце достичь 100%
             percent = int((batch_idx + 1) / total_batches * 100)
             self.progress.emit(percent)
-
-    return all_preds, all_probs
+            if hasattr(self, 'eta'):
+                self.eta.emit(f"{format_time(elapsed)} / {format_time(eta_sec)}")
+                
+    return all_preds, all_probs, manual_flags
 
 def load_model_and_tokenizer(model_dir, class_names):
     if model_dir is None:
